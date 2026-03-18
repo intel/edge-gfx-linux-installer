@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Intel Corporation
+# All rights reserved.
+
+From 1bcb7e295fc219986fee5f03d0d2354b5695786c Mon Sep 17 00:00:00 2001
+From: "Mazlan, Hazwan Arif" <hazwan.arif.mazlan@intel.com>
+Date: Wed, 28 Aug 2024 15:57:04 +0800
+Subject: [PATCH] backends/native: Add a udev flag to disable a GPU's KMS
+ capability
+
+In multi-GPU environments, there are cases where a user would like
+to use a specific GPU device in "render only" mode while letting
+other GPU devices use KMS. Therefore, adding a udev flag to disable
+(or ignore) KMS will enable the user to designate a GPU device as "render only".
+
+If this flag is set, the native backend will configure the relevant GPU device
+in headless mode (dummy MetaKmsImplDevice) and will not probe further for KMS
+capabilities during device initialization.
+
+Upstream-status: Pending
+
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Rebased-by: Mazlan, Hazwan Arif <hazwan.arif.mazlan@intel.com>
+---
+ src/backends/native/meta-backend-native.c | 3 +++
+ src/backends/native/meta-udev.c           | 7 +++++++
+ src/backends/native/meta-udev.h           | 2 ++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/src/backends/native/meta-backend-native.c b/src/backends/native/meta-backend-native.c
+index 7a8b89de0063..fc352b38a8f2 100644
+--- a/src/backends/native/meta-backend-native.c
++++ b/src/backends/native/meta-backend-native.c
+@@ -543,6 +543,9 @@ add_drm_device (MetaBackendNative  *backend_native,
+   if (meta_is_udev_device_preferred_primary (device))
+     flags |= META_KMS_DEVICE_FLAG_PREFERRED_PRIMARY;
+ 
++  if (meta_is_udev_device_disable_kms (device))
++    flags |= META_KMS_DEVICE_FLAG_NO_MODE_SETTING;
++
+   device_path = g_udev_device_get_device_file (device);
+ 
+   render_device = create_render_device (backend_native, device_path, error);
+diff --git a/src/backends/native/meta-udev.c b/src/backends/native/meta-udev.c
+index 097e8a2838a4..66d1cd0ee505 100644
+--- a/src/backends/native/meta-udev.c
++++ b/src/backends/native/meta-udev.c
+@@ -132,6 +132,13 @@ meta_is_udev_device_preferred_primary (GUdevDevice *device)
+   return g_strv_contains (tags, "mutter-device-preferred-primary");
+ }
+ 
++gboolean
++meta_is_udev_device_disable_kms (GUdevDevice *device)
++{
++  return meta_has_udev_device_tag (device,
++                                   "mutter-device-disable-kms");
++}
++
+ gboolean
+ meta_udev_is_drm_device (MetaUdev    *udev,
+                          GUdevDevice *device)
+diff --git a/src/backends/native/meta-udev.h b/src/backends/native/meta-udev.h
+index 8cb5d078816b..8abee6c7a048 100644
+--- a/src/backends/native/meta-udev.h
++++ b/src/backends/native/meta-udev.h
+@@ -40,6 +40,8 @@ gboolean meta_is_udev_test_device (GUdevDevice *device);
+ 
+ gboolean meta_is_udev_device_preferred_primary (GUdevDevice *device);
+ 
++gboolean meta_is_udev_device_disable_kms (GUdevDevice *device);
++
+ gboolean meta_udev_is_drm_device (MetaUdev    *udev,
+                                   GUdevDevice *device);
+ 
+-- 
+2.34.1
+
