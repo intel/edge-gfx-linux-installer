@@ -1,3 +1,6 @@
 [submodule "sriov-toolkit"]
 	path = sriov-toolkit
 	url = https://github.com/intel/GFX-SRIOV-Toolkit.git
+[submodule "sriov-dkms"]
+	path = sriov-dkms
+	url = https://github.com/intel/edge-gfx-dkms-installer.git

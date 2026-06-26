@@ -1,0 +1,30 @@
+# Package list for setup-prerequisites.sh
+# Format: one package per line. Lines starting with # are comments.
+
+git
+git-lfs
+apt-transport-https
+autoconf
+automake
+binutils
+bmap-tools
+bridge-utils
+build-essential
+cifs-utils
+cmake
+curl
+libslirp0
+libssl-dev
+libtool
+libxml2-utils
+net-tools
+openssh-client
+openssh-server
+openssl
+ovmf
+pciutils
+powertop
+socat
+swtpm
+swtpm-tools
+vim

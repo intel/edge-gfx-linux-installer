@@ -5,13 +5,18 @@
 
 # =============================================================================
 # Setup Prerequisites Script
-# Combines fast-boot, git configuration, and GRUB setup for Intel environment
 #
 # This script:
 # - Checks Ubuntu version compatibility (tested on 24.04.4)
+# - Installs Intel Edge kernel packages
+# - Setup GRUB to boot into Intel Edge kernel by default
+# - Installs required system packages for graphics, virtualization, build, and tools
 # - Optimizes boot performance (server images only)
-# - Configures Git (with optional proxy settings if --proxy flag provided)
-# - Sets up GRUB for Intel Xe SR-IOV support
+# - Setup PPA sources for Intel Edge kernel (public)
+#
+# Standalone examples:
+# - sudo ./setup-prerequisites.sh
+# - sudo ./setup-prerequisites.sh edge --proxy http://proxy.example.com:911 --config sriov_xe
 # =============================================================================
 
 set -euo pipefail
@@ -20,29 +25,30 @@ set -euo pipefail
 # GLOBAL CONFIGURATION
 # =============================================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 # Supported Ubuntu version
 SUPPORTED_UBUNTU_VERSION="24.04.4"
 
 # User-provided proxy (optional, passed via --proxy flag)
 PROXY_URL=""
+PACKAGE_SOURCE="edge"
+USER_CONFIG=""
+SKIP_KERNEL_INSTALL=false
 
-# Git settings
-DEFAULT_EDITOR="vim"
-DEFAULT_BRANCH="main"
-CACHE_TIMEOUT="3600"
+# Package list file (format: one package per line; comments allowed)
+PACKAGES_LIST_FILE="$SCRIPT_DIR/env-setup/packages.list"
 
 # GRUB configuration
 GRUB_CONFIG="/etc/default/grub"
-INTEL_XE_PARAMS="xe.max_vfs=24 xe.force_probe=* modprobe.blacklist=i915 udmabuf.list_limit=8192"
+INTEL_XE_PARAMS="xe.max_vfs=7 xe.force_probe=* modprobe.blacklist=i915 udmabuf.list_limit=8192"
+INTEL_I915_PARAMS="i915.enable_guc=3 i915.max_vfs=7 i915.force_probe=* udmabuf.list_limit=8192"
 CONSOLE_PARAMS="console=tty0 console=ttyS0,115200n8"
-DEFAULT_KERNEL_VERSION="6.17.0-1007-intel"
+# GPU platform resolved once from --config or auto-detection
+GPU_PLATFORM="xe"
+# Intel kernel version need to matches edge-kernel.sh package configuration
+DEFAULT_KERNEL_VERSION="linux-intel-6.18"
 GRUB_TIMEOUT="10"
-
-# Global variables for user info
-TARGET_USER=""
-TARGET_HOME=""
-USER_NAME=""
-USER_EMAIL=""
 
 # =============================================================================
 # LOGGING FUNCTIONS
@@ -69,6 +75,32 @@ log_section() {
     echo "=============================================="
     echo "  $*"
     echo "=============================================="
+}
+
+run_script() {
+    local script_path="$1"
+    shift  # Remove first argument, remaining args will be passed to the script
+    local script_name
+    script_name="$(basename "$script_path")"
+
+    if [[ ! -f "$script_path" ]]; then
+        log_error "Script not found: $script_path"
+        return 1
+    fi
+
+    if [[ ! -x "$script_path" ]]; then
+        log_info "Making $script_name executable..."
+        chmod +x "$script_path"
+    fi
+
+    log_section "Running $script_name..."
+    if "$script_path" "$@"; then
+        log_success "$script_name completed successfully"
+        return 0
+    else
+        log_error "$script_name failed with exit code $?"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -264,406 +296,196 @@ optimize_boot_performance() {
     log_info "Changes will take effect after the next reboot."
 }
 
-# =============================================================================
-# GIT CONFIGURATION
-# =============================================================================
+install_system_packages() {
+    log_section "SYSTEM PACKAGE INSTALLATION"
 
-get_target_user_info() {
-    # Determine target user and home directory
-    if [[ -n "${SUDO_USER:-}" ]]; then
-        TARGET_USER="$SUDO_USER"
-        local target_home
-        target_home=$(getent passwd "$SUDO_USER" | cut -d: -f6) || {
-            log_error "Failed to get home directory for user: $SUDO_USER"
-            exit 1
-        }
-        TARGET_HOME="$target_home"
-        log_info "Configuring for user: $TARGET_USER (home: $TARGET_HOME)"
-    elif [[ $EUID -eq 0 ]]; then
-        log_error "Running as root but no target user specified"
-        log_info "Please run with sudo to configure for the calling user"
-        exit 1
-    else
-        TARGET_USER="$USER"
-        TARGET_HOME="$HOME"
-        log_info "Configuring for current user: $TARGET_USER"
-    fi
-
-    # Verify target home directory exists and is accessible
-    if [[ ! -d "$TARGET_HOME" ]]; then
-        log_error "Target user home directory does not exist: $TARGET_HOME"
+    if [[ ! -f "$PACKAGES_LIST_FILE" ]]; then
+        log_error "Package list file not found: $PACKAGES_LIST_FILE"
         exit 1
     fi
 
-    if [[ ! -r "$TARGET_HOME" ]]; then
-        log_error "Cannot access target user home directory: $TARGET_HOME"
+    # Load package list and deduplicate for apt command usage.
+    local raw_packages
+    raw_packages=$(awk '
+        $0 ~ /^[[:space:]]*#/ { next }
+        NF >= 1 { print $1 }
+    ' "$PACKAGES_LIST_FILE") || {
+        log_error "Failed to assemble package groups"
         exit 1
-    fi
-}
+    }
 
-get_user_input() {
-    log_info "Git Configuration Setup"
+    local clean_packages
+    clean_packages=$(echo "$raw_packages" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ *//; s/ *$//') || {
+        log_error "Failed to process system package list"
+        exit 1
+    }
 
-    # Default values
-    local default_name="ECG Developer"
-    local default_email="ecg.sse.pid.gmdc.mys.graphics@intel.com"
-
-    # Ask user if they want to input custom user/email with countdown timer
-    local countdown=10
-    local user_choice=""
-
-    echo "=========================================="
-    echo "        Git Configuration Check          "
-    echo "=========================================="
-    echo ""
-    echo "Current system is using default Git credentials."
-    echo "For proper commit attribution, it's recommended to configure"
-    echo "your personal username and email address."
-    echo ""
-    echo -n "Would you like to configure your Git credentials now? [Y/n]"
-
-    while [[ $countdown -gt 0 ]]; do
-        if read -r -t 1 -n 1 user_choice 2>/dev/null; then
-            # User provided input
-            echo  # New line after user input
-            break
-        fi
-        countdown=$((countdown - 1))
-        if [[ $countdown -gt 0 ]]; then
-            # Update countdown display
-            echo -ne "\rDo you want to enter your own name and email? [y/N] (auto-continue in ${countdown}s): "
-        fi
-    done
-
-    if [[ $countdown -eq 0 ]]; then
-        echo  # New line after countdown
-        log_info "Timeout reached, using default configuration"
-        USER_NAME="$default_name"
-        USER_EMAIL="$default_email"
-    elif [[ "$user_choice" =~ ^[Yy]$ ]]; then
-        echo "=========================================="
-        echo "    GitHub Configuration Setup Wizard    "
-        echo "=========================================="
-
-        echo "This script will help you configure your Git username and email address."
-        echo "These credentials will be used for all your Git commits."
-        echo ""
-        # Get name
-        local current_name
-        current_name=$(git config --global user.name 2>/dev/null) || current_name=""
-        if [[ -n "$current_name" ]]; then
-            read -r -p "Your name [$current_name]: " USER_NAME
-            USER_NAME=${USER_NAME:-$current_name}
-        else
-            read -r -p "Your name: " USER_NAME
-        fi
-
-        # Get email
-        local current_email
-        current_email=$(git config --global user.email 2>/dev/null) || current_email=""
-        if [[ -n "$current_email" ]]; then
-            read -r -p "Your email [$current_email]: " USER_EMAIL
-            USER_EMAIL=${USER_EMAIL:-$current_email}
-        else
-            read -r -p "Your email: " USER_EMAIL
-        fi
-
-        # Validate email format
-        if [[ ! "$USER_EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
-            log_error "Invalid email format: $USER_EMAIL"
-            exit 1
-        fi
-    else
-        # Use defaults
-        USER_NAME="$default_name"
-        USER_EMAIL="$default_email"
-        log_info "Using default configuration"
+    if [[ -z "$clean_packages" ]]; then
+        log_warning "No system packages defined. Skipping installation."
+        return 0
     fi
 
-    log_info "Configuration - Name: $USER_NAME, Email: $USER_EMAIL"
-}
-
-install_git_prerequisites() {
-    log_info "Checking and installing Git prerequisites..."
-
-    local packages_to_install=()
-
-    # Check if git is installed
-    if ! command -v git >/dev/null 2>&1; then
-        log_info "Git not found, will install"
-        packages_to_install+=("git")
-    else
-        log_info "✓ Git is already installed"
-    fi
-
-    # Check if git-lfs is installed
-    if ! command -v git-lfs >/dev/null 2>&1; then
-        log_info "Git LFS not found, will install"
-        packages_to_install+=("git-lfs")
-    else
-        log_info "✓ Git LFS is already installed"
-    fi
-
-    # Install packages if needed
-    if [[ ${#packages_to_install[@]} -gt 0 ]]; then
-        log_info "Installing packages: ${packages_to_install[*]}"
-
-        # Set proxy environment variables if proxy is configured
-        local proxy_env=()
-        if [[ -n "${PROXY_URL}" ]]; then
-            proxy_env=("http_proxy=${PROXY_URL}" "https_proxy=${PROXY_URL}")
-        fi
-
-        # Update package list first
-        log_info "Updating package list..."
-        if [[ $EUID -eq 0 ]]; then
-            if [[ ${#proxy_env[@]} -gt 0 ]]; then
-                env "${proxy_env[@]}" apt-get update -qq
-            else
-                apt-get update -qq
-            fi
-        else
-            if [[ ${#proxy_env[@]} -gt 0 ]]; then
-                sudo env "${proxy_env[@]}" apt-get update -qq
-            else
-                sudo apt-get update -qq
-            fi
-        fi
-
-        # Install packages
-        if [[ $EUID -eq 0 ]]; then
-            if [[ ${#proxy_env[@]} -gt 0 ]]; then
-                env "${proxy_env[@]}" apt-get install -y "${packages_to_install[@]}"
-            else
-                apt-get install -y "${packages_to_install[@]}"
-            fi
-        else
-            if [[ ${#proxy_env[@]} -gt 0 ]]; then
-                sudo env "${proxy_env[@]}" apt-get install -y "${packages_to_install[@]}"
-            else
-                sudo apt-get install -y "${packages_to_install[@]}"
-            fi
-        fi
-
-        log_success "✓ Prerequisites installed successfully"
-    else
-        log_info "✓ All Git prerequisites are already installed"
-    fi
-}
-
-backup_existing_git_config() {
-    local gitconfig_path="$TARGET_HOME/.gitconfig"
-    if [[ -f "$gitconfig_path" ]]; then
-        local backup_file
-        backup_file="$TARGET_HOME/.gitconfig.backup.$(date +%Y%m%d-%H%M%S)" || {
-            log_error "Failed to generate backup filename"
-            exit 1
-        }
-        cp "$gitconfig_path" "$backup_file"
-        log_info "Backed up existing config to: $backup_file"
-    fi
-}
-
-create_gitconfig() {
-    log_info "Creating .gitconfig in $TARGET_HOME..."
-
-    # Prepare proxy configuration lines
-    local proxy_config=""
+    local proxy_env=()
     if [[ -n "${PROXY_URL}" ]]; then
-        proxy_config="
-[http]
-    proxy = $PROXY_URL
-    sslVerify = true
-
-[https]
-    proxy = $PROXY_URL
-    sslVerify = true
-"
+        proxy_env=("http_proxy=${PROXY_URL}" "https_proxy=${PROXY_URL}")
     fi
 
-    cat > "$TARGET_HOME/.gitconfig" << EOF
-# Git configuration for Intel environment
-# Generated on $(date)
-
-[user]
-    name = $USER_NAME
-    email = $USER_EMAIL
-$proxy_config
-[core]
-    editor = $DEFAULT_EDITOR
-    autocrlf = input
-    longpaths = true
-
-[init]
-    defaultBranch = $DEFAULT_BRANCH
-
-[push]
-    default = simple
-
-[pull]
-    rebase = false
-
-[credential]
-    helper = cache --timeout=$CACHE_TIMEOUT
-
-[color]
-    ui = auto
-
-# Git LFS configuration
-[filter "lfs"]
-    clean = git-lfs clean -- %f
-    smudge = git-lfs smudge -- %f
-    process = git-lfs filter-process
-    required = true
-
-# Useful aliases
-[alias]
-    st = status
-    co = checkout
-    br = branch
-    ci = commit
-    lg = log --oneline --graph --all
-    last = log -1 HEAD
-    unstage = reset HEAD --
-
-[merge]
-    tool = vimdiff
-
-[diff]
-    tool = vimdiff
-EOF
-
-    # Set proper ownership if running as root
-    if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
-        chown "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.gitconfig"
-        log_info "Set ownership of .gitconfig to $TARGET_USER"
+    log_info "Updating package list..."
+    if [[ $EUID -eq 0 ]]; then
+        if [[ ${#proxy_env[@]} -gt 0 ]]; then
+            env "${proxy_env[@]}" apt-get update -qq || {
+                log_error "Failed to update package list"
+                exit 1
+            }
+        else
+            apt-get update -qq || {
+                log_error "Failed to update package list"
+                exit 1
+            }
+        fi
+    else
+        if [[ ${#proxy_env[@]} -gt 0 ]]; then
+            sudo env "${proxy_env[@]}" apt-get update -qq || {
+                log_error "Failed to update package list"
+                exit 1
+            }
+        else
+            sudo apt-get update -qq || {
+                log_error "Failed to update package list"
+                exit 1
+            }
+        fi
     fi
 
-    log_success "✓ Git configuration created at $TARGET_HOME/.gitconfig"
+    log_info "Installing system packages..."
+    # Note: clean_packages needs word splitting for apt arguments.
+    # shellcheck disable=SC2086
+    if [[ $EUID -eq 0 ]]; then
+        if [[ ${#proxy_env[@]} -gt 0 ]]; then
+            env "${proxy_env[@]}" apt-get install -y $clean_packages || {
+                log_error "System package installation failed"
+                exit 1
+            }
+        else
+            apt-get install -y $clean_packages || {
+                log_error "System package installation failed"
+                exit 1
+            }
+        fi
+    else
+        if [[ ${#proxy_env[@]} -gt 0 ]]; then
+            sudo env "${proxy_env[@]}" apt-get install -y $clean_packages || {
+                log_error "System package installation failed"
+                exit 1
+            }
+        else
+            sudo apt-get install -y $clean_packages || {
+                log_error "System package installation failed"
+                exit 1
+            }
+        fi
+    fi
+
+    log_success "✓ System packages installation completed"
 }
 
-handle_default_credentials_cleanup() {
-    local default_name="ECG Developer"
-    local default_email="ecg.sse.pid.gmdc.mys.graphics@intel.com"
 
-    # Only perform cleanup if defaults were used
-    if [[ "$USER_NAME" == "$default_name" && "$USER_EMAIL" == "$default_email" ]]; then
-        log_warning "Default credentials detected - removing .gitconfig with placeholder values"
+# =============================================================================
+# EDGE KERNEL CONFIGURATION
+# =============================================================================
 
-        local gitconfig_path="$TARGET_HOME/.gitconfig"
+detect_baremetal_gpu_platform() {
+    if lsmod | grep -q "^i915\s"; then
+        printf '%s\n' "i915"
+        return 0
+    fi
 
-        # Delete the current .gitconfig that contains default values
-        if [[ -f "$gitconfig_path" ]]; then
-            rm -f "$gitconfig_path"
-            log_info "Deleted .gitconfig with default credentials"
+    if lsmod | grep -q "^xe\s"; then
+        printf '%s\n' "xe"
+        return 0
+    fi
+
+    # Driver might not be loaded yet (common early in provisioning).
+    # Infer from which kernel module is listed as available for Intel GPU.
+    local gpu_info
+    gpu_info=$(lspci -nn | grep -i "VGA\|3D\|Display" | grep "8086:" | head -1)
+
+    if [[ -z "$gpu_info" ]]; then
+        gpu_info=$(lspci -nn | grep -i "VGA\|3D\|Display" | head -1)
+    fi
+
+    if [[ -n "$gpu_info" ]] && echo "$gpu_info" | grep -q "8086:"; then
+        local gpu_pci_addr
+        gpu_pci_addr=$(echo "$gpu_info" | awk '{print $1}')
+        local candidate_module
+        candidate_module=$(lspci -k -s "$gpu_pci_addr" 2>/dev/null \
+            | grep "Kernel modules:" \
+            | tr ',' '\n' \
+            | grep -Eoiw "xe|i915" \
+            | head -1 || true)
+
+        if [[ "${candidate_module,,}" == "xe" ]]; then
+            printf '%s\n' "xe"
+            return 0
+        elif [[ "${candidate_module,,}" == "i915" ]]; then
+            printf '%s\n' "i915"
+            return 0
         fi
+    fi
 
-        # Find and restore the most recent backup
-        local backup_file
-        backup_file=$(find "$TARGET_HOME" -maxdepth 1 -name ".gitconfig.backup.*" -type f 2>/dev/null | sort | tail -1)
+    printf '%s\n' ""
+    return 1
+}
 
-        if [[ -n "$backup_file" && -f "$backup_file" ]]; then
-            cp "$backup_file" "$gitconfig_path"
+resolve_kernel_platform() {
+    if [[ -z "${USER_CONFIG:-}" ]]; then
+        local auto_platform=""
+        if auto_platform="$(detect_baremetal_gpu_platform)" && [[ -n "$auto_platform" ]]; then
+            GPU_PLATFORM="$auto_platform"
+            log_info "No --config provided"
+            log_info "Auto-detected loaded GPU module based on current kernel '$GPU_PLATFORM'"
+        else
+            GPU_PLATFORM="xe"
+            log_warning "No --config provided and no 'xe'/'i915' module loaded; defaulting to 'xe'"
+        fi
+        return 0
+    fi
 
-            # Set proper ownership if running as root
-            if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
-                chown "$TARGET_USER:$TARGET_USER" "$gitconfig_path"
+    case "$USER_CONFIG" in
+        sriov_xe)
+            GPU_PLATFORM="xe"
+            log_info "Using kernel parameter platform 'xe' from config: $USER_CONFIG"
+            ;;
+        sriov_i915)
+            GPU_PLATFORM="i915"
+            log_info "Using kernel parameter platform 'i915' from config: ${USER_CONFIG}"
+            ;;
+        baremetal)
+            local detected_platform=""
+            if detected_platform="$(detect_baremetal_gpu_platform)" && [[ -n "$detected_platform" ]]; then
+                GPU_PLATFORM="$detected_platform"
+                log_info "Detected baremetal kernel module '$GPU_PLATFORM'; using corresponding kernel parameters"
+            else
+                GPU_PLATFORM="xe"
+                log_warning "Config 'baremetal': neither 'xe' nor 'i915' kernel module is loaded; defaulting to 'xe'"
             fi
-
-            log_success "✓ Restored backup .gitconfig from: $(basename "$backup_file")"
-        else
-            log_warning "   No .gitconfig configured - no backup found"
-            log_warning "   Please configure your Git identity with:"
-            log_warning "   git config --global user.name 'Your Name'"
-            log_warning "   git config --global user.email 'your.email@intel.com'"
-        fi
-        return 0  # Indicate cleanup was performed
-    fi
-    return 1  # Indicate no cleanup was needed
+            ;;
+        *)
+            log_error "Unknown config override: $USER_CONFIG"
+            exit 1
+            ;;
+    esac
 }
 
-setup_git_lfs() {
-    log_info "Setting up Git LFS..."
+install_edge_kernel() {
+    local package_source="${1:-edge}"
 
-    # Check if git-lfs is available
-    if ! command -v git-lfs >/dev/null 2>&1; then
-        log_error "git-lfs not found. This should have been installed earlier."
+    # Run Intel kernel setup
+    log_section "INTEL KERNEL INSTALLATION"
+    run_script "$SCRIPT_DIR/components/edge-kernel.sh" "$package_source" || {
+        log_error "Intel kernel setup failed"
         return 1
-    fi
-
-    # Install LFS for the target user
-    if [[ $EUID -eq 0 ]] && [[ -n "${SUDO_USER:-}" ]]; then
-        # Run as target user with proper environment
-        log_info "Installing Git LFS for user: $TARGET_USER"
-        if sudo -u "$TARGET_USER" -H git lfs install; then
-            log_success "✓ Git LFS configured for $TARGET_USER"
-        else
-            log_error "Failed to configure Git LFS"
-            return 1
-        fi
-    else
-        # Run as current user
-        log_info "Installing Git LFS for current user"
-        if git lfs install; then
-            log_success "✓ Git LFS configured"
-        else
-            log_error "Failed to configure Git LFS"
-            return 1
-        fi
-    fi
-}
-
-configure_git() {
-    log_section "GIT CONFIGURATION"
-
-    # Determine target user and home directory
-    get_target_user_info
-
-    # Install prerequisites (git and git-lfs)
-    install_git_prerequisites
-
-    # Check if .gitconfig already exists with valid configuration
-    local gitconfig_path="$TARGET_HOME/.gitconfig"
-    local skip_config_creation=false
-
-    if [[ -f "$gitconfig_path" ]]; then
-        log_info "Checking existing .gitconfig for valid configuration..."
-
-        # Check if both name and email are configured
-        local existing_name existing_email existing_lfs
-        existing_name=$(git config --global user.name 2>/dev/null || echo "")
-        existing_email=$(git config --global user.email 2>/dev/null || echo "")
-        existing_lfs=$(git lfs version 2>/dev/null && git config --global filter.lfs.clean 2>/dev/null || echo "")
-
-        if [[ -n "$existing_name" && -n "$existing_email" && -n "$existing_lfs" ]]; then
-            log_info "Found valid Git configuration:"
-            log_info "  Name: $existing_name"
-            log_info "  Email: $existing_email"
-            log_info "Skipping .gitconfig backup and recreation"
-            skip_config_creation=true
-        fi
-    fi
-
-    if [[ "$skip_config_creation" == "false" ]]; then
-        # Get user input
-        get_user_input
-
-        # Backup existing config
-        backup_existing_git_config
-
-        # Create new config
-        create_gitconfig
-    fi
-
-    # Setup Git LFS
-    setup_git_lfs
-
-    # Handle cleanup of default credentials if used
-    if ! handle_default_credentials_cleanup; then
-        log_success "Git configuration completed!"
-    else
-        log_warning "Default credentials removed."
-    fi
+    }
 }
 
 # =============================================================================
@@ -685,35 +507,46 @@ backup_grub_config() {
     fi
 }
 
-detect_kernel_version() {
-    log_info "Detecting available Intel kernels..."
+configure_grub_kernel_default() {
+    log_info "Verifying target Intel kernel version..."
 
-    # Look for Intel kernels in /boot using find instead of ls
-    local intel_kernels
-    if [[ -d "/boot" ]]; then
-        intel_kernels=$(find /boot -maxdepth 1 -name "vmlinuz-*intel" -type f 2>/dev/null | \
-                       sed 's|.*/vmlinuz-||' | sort -V | tail -1) || intel_kernels=""
-    else
-        intel_kernels=""
-    fi
-
-    if [[ -n "$intel_kernels" ]]; then
-        DEFAULT_KERNEL_VERSION="$intel_kernels"
-        log_info "Detected Intel kernel: $DEFAULT_KERNEL_VERSION"
-    else
-        log_warning "No Intel kernel found, using default: $DEFAULT_KERNEL_VERSION"
-    fi
-}
-
-configure_grub_default() {
-    log_info "Configuring default kernel selection..."
-
-    # Validate kernel version is set
+    # Validate kernel version is configured
     if [[ -z "$DEFAULT_KERNEL_VERSION" ]]; then
-        log_error "No kernel version specified"
+        log_error "No target Intel kernel configured"
         exit 1
     fi
 
+    local configured_kernel="$DEFAULT_KERNEL_VERSION"
+
+    if [[ ! -d "/boot" ]]; then
+        log_warning "/boot directory not found. Keeping configured target: $configured_kernel"
+        log_warning "⚠ DEFAULT_KERNEL_VERSION install status: unknown (boot directory unavailable)"
+    else
+        # 1) Exact filename check (already an exact kernel string).
+        if [[ -f "/boot/vmlinuz-$configured_kernel" ]]; then
+            log_success "✓ Intel kernel is available in /boot: $configured_kernel"
+            log_success "✓ DEFAULT_KERNEL_VERSION is installed: $configured_kernel"
+        else
+            # 2) Train/package style check (example: linux-intel-6.18 -> 6.18).
+            local configured_train="${configured_kernel#linux-intel-}"
+            local matched_installed_kernel=""
+            matched_installed_kernel=$(find /boot -maxdepth 1 -type f -name "vmlinuz-*${configured_train}*intel*" 2>/dev/null | \
+                sed 's|.*/vmlinuz-||' | sort -V | tail -1) || matched_installed_kernel=""
+
+            if [[ -z "$matched_installed_kernel" ]]; then
+                log_warning "No matching Intel kernel found in /boot for target: $configured_kernel"
+                log_warning "Intel kernel may not be installed yet"
+                log_warning "⚠ DEFAULT_KERNEL_VERSION is not installed: $configured_kernel"
+            else
+                DEFAULT_KERNEL_VERSION="$matched_installed_kernel"
+                log_success "✓ Intel kernel is available in /boot: $DEFAULT_KERNEL_VERSION"
+                log_success "✓ DEFAULT_KERNEL_VERSION is installed (resolved): $DEFAULT_KERNEL_VERSION"
+            fi
+        fi
+    fi
+
+    # Configure GRUB default using verified kernel
+    log_info "Configuring default kernel selection..."
     local target_kernel="Advanced options for Ubuntu>Ubuntu, with Linux $DEFAULT_KERNEL_VERSION"
 
     # Update or add GRUB_DEFAULT
@@ -725,6 +558,7 @@ configure_grub_default() {
         log_info "Added GRUB_DEFAULT for Intel kernel"
     fi
 }
+
 
 configure_grub_timeout() {
     log_info "Configuring GRUB timeout..."
@@ -744,10 +578,28 @@ configure_grub_timeout() {
     log_info "Set GRUB timeout to $GRUB_TIMEOUT seconds"
 }
 
-configure_kernel_parameters() {
-    log_info "Configuring kernel parameters for Intel Xe SR-IOV..."
+configure_grub_parameters() {
+    local effective_platform
+    local platform_params
 
-    local all_params="$INTEL_XE_PARAMS $CONSOLE_PARAMS"
+    effective_platform="${GPU_PLATFORM:-xe}"
+
+    case "$effective_platform" in
+        xe)
+            platform_params="$INTEL_XE_PARAMS"
+            log_info "Configuring kernel parameters for Intel Xe SR-IOV..."
+            ;;
+        i915)
+            platform_params="$INTEL_I915_PARAMS"
+            log_info "Configuring kernel parameters for Intel i915..."
+            ;;
+        *)
+            log_error "Unknown GPU platform: $effective_platform (expected: xe or i915)"
+            exit 1
+            ;;
+    esac
+
+    local all_params="$platform_params $CONSOLE_PARAMS"
 
     # Update or add kernel command line parameters
     if grep -q "^GRUB_CMDLINE_LINUX=" "$GRUB_CONFIG"; then
@@ -760,7 +612,7 @@ configure_kernel_parameters() {
     fi
 
     log_info "Kernel parameters configured:"
-    log_info "  - Intel Xe: $INTEL_XE_PARAMS"
+    log_info "  - Platform ($effective_platform): $platform_params"
     log_info "  - Console: $CONSOLE_PARAMS"
 }
 
@@ -785,18 +637,58 @@ configure_grub() {
     # Backup existing configuration
     backup_grub_config
 
-    # Detect best kernel version
-    detect_kernel_version
+    # Verify kernel version and configure GRUB default
+    configure_grub_kernel_default
 
-    # Configure GRUB settings
-    configure_grub_default
+    # Configure additional GRUB settings
     configure_grub_timeout
-    configure_kernel_parameters
+    configure_grub_parameters
 
     # Apply changes
     update_grub
 
     log_success "✓ GRUB configuration completed!"
+}
+
+# =============================================================================
+# PPA CONFIGURATION
+# =============================================================================
+
+setup_ppa_source() {
+    local package_source="${1:-edge}"
+
+    log_section "PPA CONFIGURATION"
+
+    # Source common-helper.sh to leverage its PPA management functions
+    local common_helper_script="$SCRIPT_DIR/components/common-helper.sh"
+    if [[ ! -f "$common_helper_script" ]]; then
+        log_error "common-helper.sh not found: $common_helper_script"
+        return 1
+    fi
+
+    # Export PPA_SELECTOR based on package_source for common-helper.sh
+    case "$package_source" in
+        edge)
+            export PPA_SELECTOR="edge"
+            log_info "Setting up Intel Edge Graphics PPA"
+            ;;
+        *)
+            log_warning "Unknown package source: $package_source, defaulting to edge"
+            export PPA_SELECTOR="edge"
+            ;;
+    esac
+
+    # Source and execute PPA configuration from common-helper.sh
+    # shellcheck disable=SC1090
+    source "$common_helper_script"
+
+    # Use common-helper's PPA setup functionality
+    if ! setup_selected_ppa "$common_helper_script" "$PPA_SELECTOR" "Intel Graphics PPA ($PPA_SELECTOR)"; then
+        log_error "Failed to setup PPA"
+        return 1
+    fi
+
+    log_success "✓ PPA configuration completed"
 }
 
 # =============================================================================
@@ -817,18 +709,20 @@ show_final_summary() {
         echo "• Boot optimization skipped (desktop image)"
     fi
 
-    if [[ -n "${PROXY_URL}" ]]; then
-        echo "✓ Git configured with proxy settings"
+    if [[ ! -d "/boot" ]]; then
+        echo "⚠ DEFAULT_KERNEL_VERSION install status: unknown (boot directory unavailable)"
+    elif [[ -f "/boot/vmlinuz-$DEFAULT_KERNEL_VERSION" ]]; then
+        echo "✓ DEFAULT_KERNEL_VERSION installed: $DEFAULT_KERNEL_VERSION"
     else
-        echo "✓ Git configured"
+        echo "⚠ DEFAULT_KERNEL_VERSION not found in /boot: $DEFAULT_KERNEL_VERSION"
     fi
 
-    echo "✓ GRUB configured for Intel Xe SR-IOV"
+    echo "✓ GRUB configured for Intel ${GPU_PLATFORM^^} SR-IOV"
     echo ""
     echo "Next steps:"
-    echo "1. Install SAI and ECG components"
+    echo "1. Install Edge Overlay Components"
     echo "2. Reboot the system"
-    echo "3. Verify Intel Xe driver loads: lsmod | grep xe"
+    echo "3. Verify Intel ${GPU_PLATFORM^^} driver loads: lsmod | grep ${GPU_PLATFORM}"
     echo ""
     log_warning "IMPORTANT: Reboot required for all changes to take effect"
 }
@@ -844,25 +738,55 @@ main() {
                     shift 2
                 else
                     log_error "--proxy requires a URL argument"
-                    log_info "Usage: sudo $0 [--proxy URL]"
+                    log_info "Usage: sudo $0 [edge] [--proxy URL] [--config CONFIG] [--skip-kernel]"
                     exit 1
                 fi
                 ;;
+            --config)
+                if [[ -n "$2" && "$2" =~ ^(sriov_i915|sriov_xe|baremetal)$ ]]; then
+                    USER_CONFIG="$2"
+                    log_info "Using configuration override: $USER_CONFIG"
+                    shift 2
+                else
+                    log_error "--config requires one of: sriov_i915, sriov_xe, baremetal"
+                    exit 1
+                fi
+                ;;
+            --skip-kernel)
+                SKIP_KERNEL_INSTALL=true
+                log_info "Skipping kernel installation inside setup-prerequisites"
+                shift
+                ;;
             --help|-h)
-                echo "Usage: sudo $0 [--proxy URL]"
+                echo "Usage: sudo $0 [edge] [--proxy URL] [--config CONFIG] [--skip-kernel]"
                 echo ""
                 echo "Options:"
-                echo "  --proxy URL    Optional proxy server URL (e.g., http://proxy.example.com:911)"
-                echo "  --help, -h     Show this help message"
+                echo "  edge              Use Intel Edge package source (default)"
+                echo "  --proxy URL       Optional proxy server URL (e.g., http://proxy.example.com:911)"
+                echo "  --config CONFIG   Use SR-IOV config override (sriov_i915|sriov_xe|baremetal)"
+                echo "  --skip-kernel     Skip edge-kernel.sh invocation (used by install-host orchestrator)"
+                echo "  --help, -h        Show this help message"
                 exit 0
+                ;;
+            edge)
+                PACKAGE_SOURCE="$1"
+                log_info "Using package source: $PACKAGE_SOURCE"
+                shift
                 ;;
             *)
                 log_error "Unknown option: $1"
-                log_info "Usage: sudo $0 [--proxy URL]"
+                log_info "Usage: sudo $0 [edge] [--proxy URL] [--config CONFIG] [--skip-kernel]"
                 exit 1
                 ;;
         esac
     done
+
+    if [[ "$PACKAGE_SOURCE" == "edge" ]]; then
+        log_info "No package source provided; defaulting to edge"
+    fi
+
+    # Resolve GPU platform once from --config or runtime module detection.
+    resolve_kernel_platform
 
     log_section "SETUP PREREQUISITES FOR INTEL ENVIRONMENT"
 
@@ -870,11 +794,19 @@ main() {
     check_ubuntu_version
     check_privileges
 
-    # Execute setup steps
-    optimize_boot_performance
-    configure_git
-    configure_grub
+    setup_ppa_source "$PACKAGE_SOURCE"
 
+    # Execute setup steps
+    if [[ "$SKIP_KERNEL_INSTALL" == "true" ]]; then
+        log_info "Skipping edge-kernel.sh in setup-prerequisites (already handled by caller)"
+    else
+        install_edge_kernel "$PACKAGE_SOURCE"
+    fi
+    install_system_packages
+    # Boot optimization is only applied to server images,
+    # it will detect and skip if running on desktop
+    optimize_boot_performance
+    configure_grub
     # Final summary
     show_final_summary
 

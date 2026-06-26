@@ -3,182 +3,63 @@
 # Copyright (c) 2026 Intel Corporation
 # All rights reserved.
 
-# ============================================================================
-# SPICE and SPICE-gtk Installation Script for Intel SRIOV Toolkit
-# Version: 1.0
-# ============================================================================
+# =============================================================================
+# Intel Edge Graphics SPICE Setup Script
 #
-# Description:
-#   This script downloads and installs SPICE and SPICE-gtk packages from Intel's
-#   Linux overlay repository. It handles the complete installation process
+# This script:
+# - Calls common-helper.sh with edge selector to set up the selected Intel PPA
+# - Sets high priority (800) for SPICE components from selected PPA
+# - Installs SPICE packages using apt-get install
+# - Verifies installed SPICE versions against preferred targets
 #
-# Usage:
-#   ./spice.sh
+# Usage: sudo ./spice.sh [edge]
 #
-# ============================================================================
+# =============================================================================
 
 set -euo pipefail
 
-# Error cleanup function
-cleanup_on_error() {
-    echo "Error occurred during installation."
+# =============================================================================
+# CONFIGURATION SECTION
+# =============================================================================
 
-    # Remove corrupted/incomplete download directory to ensure fresh download on retry
-    if [[ -d "$INSTALL_DIR" ]]; then
-        echo "  Removing corrupted installation directory: $INSTALL_DIR"
-        rm -rf "$INSTALL_DIR"
-    fi
-    exit 1
-}
-
-# Set up error trap
-trap cleanup_on_error ERR
-
-# Get script directory and set WORK_DIR to the installer directory
+# Get script directory for locating sibling scripts
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-if [[ "$(basename "$SCRIPT_DIR")" == "components" ]]; then
-    WORK_DIR="$(dirname "$SCRIPT_DIR")"
-else
-    WORK_DIR="$SCRIPT_DIR"
+COMMON_PIN_HELPER="$SCRIPT_DIR/common-helper.sh"
+
+# Component runtime context is provided by common-helper.
+if [[ ! -f "$COMMON_PIN_HELPER" ]]; then
+	echo -e "\033[0;31m[ERROR]\033[0m Common helper not found: $COMMON_PIN_HELPER" >&2
+	exit 1
 fi
 
-# Use persistent installer/deb/spice directory
-readonly INSTALL_DIR="$WORK_DIR/deb/qemu"
-readonly SPICE_URL="https://download.01.org/intel-linux-overlay/ubuntu/pool/main/s/spice"
-readonly SPICE_GTK_URL="https://download.01.org/intel-linux-overlay/ubuntu/pool/main/s/spice-gtk"
+eval "$(bash "$COMMON_PIN_HELPER" --invoke init-component-context "$COMMON_PIN_HELPER" "$@")"
+
+# Preferred SPICE versions
 readonly SPICE_VERSION="0.15.2-1ppa1~noble7"
-readonly SPICE_GTK_VERSION="0.42-1ppa1~noble3"
+readonly SPICE_GTK_VERSION="0.42-1ppa1~noble4"
 
-# SPICE packages to download
+# SPICE package names for installation
 readonly SPICE_PACKAGES=(
-    "libspice-server1_${SPICE_VERSION}_amd64.deb"
+	"libspice-server1"
+	"libspice-server-dev"
 )
 
-# SPICE-gtk packages to download
 readonly SPICE_GTK_PACKAGES=(
-    "libspice-client-glib-2.0-8_${SPICE_GTK_VERSION}_amd64.deb"
-    "libspice-client-gtk-3.0-5_${SPICE_GTK_VERSION}_amd64.deb"
-    "spice-client-glib-usb-acl-helper_${SPICE_GTK_VERSION}_amd64.deb"
-    "spice-client-gtk_${SPICE_GTK_VERSION}_amd64.deb"
+	"libspice-client-glib-2.0-8"
+	"libspice-client-gtk-3.0-5"
+	"spice-client-glib-usb-acl-helper"
+	"spice-client-gtk"
 )
 
-# Function to check if all required packages exist
-check_existing_packages() {
-    local missing_packages=()
-    local all_packages=()
-
-    # Combine all package arrays
-    all_packages+=("${SPICE_PACKAGES[@]}")
-    all_packages+=("${SPICE_GTK_PACKAGES[@]}")
-
-    # Check each package
-    for package in "${all_packages[@]}"; do
-        if [[ ! -f "$INSTALL_DIR/$package" ]]; then
-            missing_packages+=("$package")
-        fi
-    done
-
-    if [[ ${#missing_packages[@]} -eq 0 ]]; then
-        return 0  # All packages exist
-    else
-        return 1  # Some packages missing
-    fi
-}
-
-# Function to install packages with retry logic
-install_packages_with_retry() {
-    local max_attempts=3
-    local attempt=1
-
-    while [[ $attempt -le $max_attempts ]]; do
-        echo "Installing all packages... (Attempt $attempt of $max_attempts)"
-
-        if sudo dpkg -i ./*.deb; then
-            echo "SPICE and SPICE-gtk installation completed successfully."
-            return 0
-        else
-            echo "Detected package dependency issues. Attempting automatic recovery..."
-            if sudo apt-get install -f -y; then
-                echo "Dependencies resolved. Retrying installation..."
-                attempt=$((attempt + 1))
-            else
-                echo "Error: Failed to resolve dependencies"
-                return 1
-            fi
-        fi
-    done
-
-    echo "Error: Failed to install packages after $max_attempts attempts"
-    return 1
-}
+# =============================================================================
+# MAIN FUNCTIONS
+# =============================================================================
 
 main() {
-    # Case 1: Directory exists and all packages exist - just install
-    if [[ -d "$INSTALL_DIR" ]] && check_existing_packages; then
-        echo "All SPICE and SPICE-gtk packages found in $INSTALL_DIR"
-        echo "Installing existing packages..."
-        cd "$INSTALL_DIR"
-
-        if install_packages_with_retry; then
-            echo "SPICE and SPICE-gtk installation completed successfully using existing packages."
-            return 0
-        else
-            echo "Failed to install existing packages. Will download fresh copies."
-            # Remove corrupted packages and continue to fresh download
-            rm -rf "$INSTALL_DIR"
-        fi
-    fi
-
-    # Case 2: Directory exists but some packages missing - download missing ones
-    if [[ -d "$INSTALL_DIR" ]]; then
-        echo "Some SPICE/SPICE-gtk packages missing in $INSTALL_DIR"
-        echo "Downloading missing packages..."
-        cd "$INSTALL_DIR"
-    else
-        # Case 3: No directory - fresh download
-        echo "Setting up installation directory for fresh download..."
-        mkdir -p "$INSTALL_DIR"
-        cd "$INSTALL_DIR"
-    fi
-
-    echo "Downloading SPICE packages..."
-    for package in "${SPICE_PACKAGES[@]}"; do
-        if [[ -f "$package" ]]; then
-            echo "  $package already exists, skipping download"
-        else
-            echo "  Downloading $package"
-            wget --no-check-certificate "$SPICE_URL/$package" || {
-                echo "Error: Failed to download $package from $SPICE_URL"
-                exit 1
-            }
-        fi
-    done
-
-    echo "Downloading SPICE-gtk packages..."
-    for package in "${SPICE_GTK_PACKAGES[@]}"; do
-        if [[ -f "$package" ]]; then
-            echo "  $package already exists, skipping download"
-        else
-            echo "  Downloading $package"
-            wget --no-check-certificate "$SPICE_GTK_URL/$package" || {
-                echo "Error: Failed to download $package from $SPICE_GTK_URL"
-                exit 1
-            }
-        fi
-    done
-
-    if install_packages_with_retry; then
-        # Disable error trap before normal cleanup
-        trap - ERR
-        echo "Cleaning up..."
-        cd "$WORK_DIR"
-
-        echo "SPICE and SPICE-gtk installation completed successfully."
-        echo "Downloaded packages preserved in: $INSTALL_DIR"
-    else
-        echo "Error: Failed to install packages"
-        exit 1
-    fi
+	log_component_banner "SPICE Debian Setup"
+	bash "$COMMON_PIN_HELPER" --invoke prepare-component-install "$PPA_SCRIPT" "$PPA_SELECTOR" "$PPA_NAME" "$PREFERENCES_FILE" "$PPA_PIN_ORIGIN" "$COMPONENT_PIN_PRIORITY" -- "${SPICE_PACKAGES[@]}" "${SPICE_GTK_PACKAGES[@]}"
+	bash "$COMMON_PIN_HELPER" --invoke verify-component-packages-by-groups "$PPA_NAME" "-" "-" "-" --group "$SPICE_VERSION" -- "${SPICE_PACKAGES[@]}" --group "$SPICE_GTK_VERSION" -- "${SPICE_GTK_PACKAGES[@]}"
+	log_component_completion "SPICE Debian setup" "SPICE components have been installed with priority $COMPONENT_PIN_PRIORITY from $PPA_NAME"
 }
 
 main "$@"
